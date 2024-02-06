@@ -152,7 +152,7 @@ func (p *Pool) retrieveWorker() *Worker {
 		w.run()
 	} else {
 		for {
-			// 等待执行器空闲
+			// 当前线程睡眠，等待其他线程唤醒
 			p.cond.Wait()
 			l := len(p.workers) - 1
 			if l < 0 {
