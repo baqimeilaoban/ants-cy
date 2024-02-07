@@ -16,7 +16,7 @@ type Pool struct {
 	lock           sync.Mutex        // 锁，保证并发安全
 	cond           *sync.Cond        // 等待空闲执行器
 	once           sync.Once         // 保证协程池的关闭只执行一次
-	workCache      sync.Pool         // 用于加速获取可用执行器
+	workCache      sync.Pool         // 用于加速获取可用执行器，引入golang的缓存池
 	PanicHandler   func(interface{}) // 用于捕捉panic
 }
 
@@ -48,6 +48,7 @@ func (p *Pool) periodicallyPurge() {
 	// 初始化定时器
 	heatBeat := time.NewTicker(p.expiryDuration)
 	defer heatBeat.Stop()
+	var expiredWorkers []*Worker
 	for range heatBeat.C {
 		// 原子方式加载值，安全
 		if CLOSE == atomic.LoadInt32(&p.release) {
@@ -56,25 +57,25 @@ func (p *Pool) periodicallyPurge() {
 		currentTime := time.Now()
 		p.lock.Lock()
 		// 空闲执行器
-		idleWorks := p.workers
-		n := -1
-		for i, w := range idleWorks {
-			// 当前时间减去当前执行器更新时间小于清理时间时，不进行清理
-			if currentTime.Sub(w.recycleTime) <= p.expiryDuration {
-				break
-			}
-			n = i
-			w.task <- nil
-			idleWorks[i] = nil
+		idleWorkers := p.workers
+		n := len(idleWorkers)
+		i := 0
+		for i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration {
+			i++
 		}
-		if n > -1 {
-			if n >= len(idleWorks)-1 {
-				p.workers = idleWorks[:0]
-			} else {
-				p.workers = idleWorks[n+1:]
+		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
+		if i > 0 {
+			m := copy(idleWorkers, idleWorkers[i:])
+			for i := m; i < n; i++ {
+				idleWorkers[i] = nil
 			}
+			p.workers = idleWorkers[:m]
 		}
 		p.lock.Unlock()
+		for i, w := range expiredWorkers {
+			w.task <- nil
+			expiredWorkers[i] = nil
+		}
 	}
 }
 
@@ -138,7 +139,7 @@ func (p *Pool) retrieveWorker() *Worker {
 		idleWorkers[n] = nil
 		p.workers = idleWorkers[:n]
 		p.lock.Unlock()
-	} else if p.running < p.capacity {
+	} else if p.Running() < p.Cap() {
 		p.lock.Unlock()
 		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
 			w = cacheWorker.(*Worker)
@@ -183,7 +184,7 @@ func (p *Pool) decRunning() {
 	atomic.AddInt32(&p.running, -1)
 }
 
-// revertWorker 将一个执行器放回协程池中，并回收线程
+// revertWorker 归还执行器入协程池中
 func (p *Pool) revertWorker(worker *Worker) bool {
 	if CLOSE == atomic.LoadInt32(&p.release) {
 		return false

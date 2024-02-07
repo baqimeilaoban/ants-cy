@@ -25,30 +25,32 @@ type PoolWithFunc struct {
 func (p *PoolWithFunc) periodicallyPurge() {
 	heatBeat := time.NewTicker(p.expiryDuration)
 	defer heatBeat.Stop()
+	var expiredWorkers []*WorkWithFunc
 	for range heatBeat.C {
 		if CLOSE == atomic.LoadInt32(&p.release) {
 			break
 		}
 		currentTime := time.Now()
 		p.lock.Lock()
-		idleWorks := p.workers
-		n := -1
-		for i, w := range idleWorks {
-			if currentTime.Sub(w.recycleTime) <= p.expiryDuration {
-				break
-			}
-			n = i
-			w.args <- nil
-			idleWorks[i] = nil
+		idleWorkers := p.workers
+		n := len(idleWorkers)
+		i := 0
+		for i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration {
+			i++
 		}
-		if n > -1 {
-			if n >= len(idleWorks)-1 {
-				p.workers = idleWorks[:0]
-			} else {
-				p.workers = idleWorks[n+1:]
+		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
+		if i > 0 {
+			m := copy(idleWorkers, idleWorkers[i:])
+			for i := m; i < n; i++ {
+				idleWorkers[i] = nil
 			}
+			p.workers = idleWorkers[:m]
 		}
 		p.lock.Unlock()
+		for i, w := range expiredWorkers {
+			w.args <- nil
+			expiredWorkers[i] = nil
+		}
 	}
 }
 
@@ -137,7 +139,7 @@ func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 		idleWorkers[n] = nil
 		p.workers = idleWorkers[:n]
 		p.lock.Unlock()
-	} else if p.running < p.capacity {
+	} else if p.Running() < p.Cap() {
 		p.lock.Unlock()
 		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
 			w = cacheWorker.(*WorkWithFunc)
