@@ -25,4 +25,26 @@ var (
 		}
 		return 1
 	}
+	// 引入包时直接初始化一个
+	defaultAntsPool, _ = NewPool(DEFAULT_ANTS_POOL_SIZE)
 )
+
+// Submit 提交一个任务到协程池
+func Submit(task func()) error {
+	return defaultAntsPool.Submit(task)
+}
+
+// Cap 默认协程池大小
+func Cap() int {
+	return defaultAntsPool.Cap()
+}
+
+// Free 默认协程池可用线程数
+func Free() int {
+	return defaultAntsPool.Free()
+}
+
+// Release 关闭默认线程池
+func Release()  {
+	_ =defaultAntsPool.Release()
+}
