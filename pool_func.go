@@ -17,7 +17,7 @@ type PoolWithFunc struct {
 	cond           *sync.Cond        // 等待获取空闲执行器，用于线程间通信
 	poolFunc       func(interface{}) // 执行任务的方法
 	once           sync.Once         // 保证该线程池只会被关闭一次
-	workCache      sync.Pool         // 提高性能，利用pool短暂存储数据
+	workCache      sync.Pool         // 提高性能，利用pool暂存数据
 	PanicHandler   func(interface{}) // panic后的处理方法
 }
 
@@ -27,6 +27,7 @@ func (p *PoolWithFunc) periodicallyPurge() {
 	defer heatBeat.Stop()
 	var expiredWorkers []*WorkWithFunc
 	for range heatBeat.C {
+		// 若是线程池已经被关闭，则直接退出清理，释放空间
 		if CLOSE == atomic.LoadInt32(&p.release) {
 			break
 		}
@@ -38,6 +39,7 @@ func (p *PoolWithFunc) periodicallyPurge() {
 		for i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration {
 			i++
 		}
+		// 已过期待删除执行器
 		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
 		if i > 0 {
 			m := copy(idleWorkers, idleWorkers[i:])
@@ -54,22 +56,38 @@ func (p *PoolWithFunc) periodicallyPurge() {
 	}
 }
 
+// NewPoolWithFunc 初始化协程池
 func NewPoolWithFunc(size int, pf func(interface{})) (*PoolWithFunc, error) {
-	return NewTimingPoolWithFunc(size, DEFAULT_CLEAN_INERVAL_TIME, pf)
+	return NewUltimatePoolWithFunc(size, DEFAULT_CLEAN_INERVAL_TIME, pf, false)
 }
 
-// NewTimingPoolWithFunc 初始化协程池，指定size/expiry/pf
-func NewTimingPoolWithFunc(size, expiry int, pf func(interface{})) (*PoolWithFunc, error) {
+// NewPoolWithFuncPreMalloc 初始化协程池，预先分配内存
+func NewPoolWithFuncPreMalloc(size int, pf func(interface{})) (*PoolWithFunc, error) {
+	return NewUltimatePoolWithFunc(size, DEFAULT_CLEAN_INERVAL_TIME, pf, true)
+}
+
+// NewUltimatePoolWithFunc 初始化协程池，指定size/expiry/pf
+func NewUltimatePoolWithFunc(size, expiry int, pf func(interface{}), preMalloc bool) (*PoolWithFunc, error) {
 	if size < 0 {
 		return nil, ErrInvalidPoolSize
 	}
 	if expiry < 0 {
 		return nil, ErrInvalidPoolExpiry
 	}
-	p := &PoolWithFunc{
-		capacity:       int32(size),
-		expiryDuration: time.Duration(expiry) * time.Second,
-		poolFunc:       pf,
+	var p *PoolWithFunc
+	if preMalloc {
+		p = &PoolWithFunc{
+			capacity:       int32(size),
+			expiryDuration: time.Duration(expiry) * time.Second,
+			workers:        make([]*WorkWithFunc, 0, size),
+			poolFunc:       pf,
+		}
+	} else {
+		p = &PoolWithFunc{
+			capacity:       int32(size),
+			expiryDuration: time.Duration(expiry) * time.Second,
+			poolFunc:       pf,
+		}
 	}
 	p.cond = sync.NewCond(&p.lock)
 	go p.periodicallyPurge()
@@ -128,6 +146,16 @@ func (p *PoolWithFunc) Release() error {
 	return nil
 }
 
+// incRunning 活跃线程数+1
+func (p *PoolWithFunc) incRunning() {
+	atomic.AddInt32(&p.running, 1)
+}
+
+// decRunning 线程数-1
+func (p *PoolWithFunc) decRunning() {
+	atomic.AddInt32(&p.running, -1)
+}
+
 // retrieveWorker 分配可用的执行器执行任务
 func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 	var w *WorkWithFunc
@@ -151,30 +179,18 @@ func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 		}
 		w.run()
 	} else {
-		for {
-			p.cond.Wait()
-			l := len(p.workers) - 1
-			if l < 0 {
-				continue
-			}
-			w = p.workers[l]
-			p.workers[l] = nil
-			p.workers = p.workers[:l]
-			break
+	Reentry:
+		p.cond.Wait()
+		l := len(p.workers) - 1
+		if l < 0 {
+			goto Reentry
 		}
+		w = p.workers[l]
+		p.workers[l] = nil
+		p.workers = p.workers[:l]
 		p.lock.Unlock()
 	}
 	return w
-}
-
-// incRunning 活跃线程数+1
-func (p *PoolWithFunc) incRunning() {
-	atomic.AddInt32(&p.running, 1)
-}
-
-// decRunning 线程数-1
-func (p *PoolWithFunc) decRunning() {
-	atomic.AddInt32(&p.running, -1)
 }
 
 // 将执行器放回协程池中，并更新过期刷新时间
