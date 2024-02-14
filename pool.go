@@ -20,43 +20,6 @@ type Pool struct {
 	PanicHandler   func(interface{}) // 用于捕捉panic
 }
 
-// NewPool 初始化协程池，需指定协程池大小
-func NewPool(size int) (*Pool, error) {
-	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, false)
-}
-
-// NewPoolPreMalloc 创建预分配空间的协程池
-func NewPoolPreMalloc(size int) (*Pool, error) {
-	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, true)
-}
-
-// NewUltimatePool 初始化协程池，需指定协程池大小，并且定义不活跃线程的清理时间
-func NewUltimatePool(size, expiry int, preAlloc bool) (*Pool, error) {
-	if size < 0 {
-		return nil, ErrInvalidPoolSize
-	}
-	if expiry < 0 {
-		return nil, ErrInvalidPoolExpiry
-	}
-	var p *Pool
-	if preAlloc {
-		p = &Pool{
-			capacity:       int32(size),
-			expiryDuration: time.Duration(expiry) * time.Second,
-			workers:        make([]*Worker, 0, size), // 预分配内存
-		}
-	} else {
-		p = &Pool{
-			capacity:       int32(size),
-			expiryDuration: time.Duration(expiry) * time.Second,
-		}
-	}
-	p.cond = sync.NewCond(&p.lock)
-	// 协程清理空闲执行器
-	go p.periodicallyPurge()
-	return p, nil
-}
-
 // periodicallyPurge 定时清理过期执行器
 func (p *Pool) periodicallyPurge() {
 	// 初始化定时器
@@ -90,7 +53,49 @@ func (p *Pool) periodicallyPurge() {
 			w.task <- nil
 			expiredWorkers[i] = nil
 		}
+		// 若是活跃的线程数为0，则通知所有等待的线程执行后续操作，若是不通知还在等待的线程，可能会造成内存泄漏
+		// 并且部分任务无法得到执行，一直卡在等待中
+		if p.Running() == 0 {
+			p.cond.Broadcast()
+		}
 	}
+}
+
+// NewPool 初始化协程池，需指定协程池大小
+func NewPool(size int) (*Pool, error) {
+	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, false)
+}
+
+// NewPoolPreMalloc 创建预分配空间的协程池
+func NewPoolPreMalloc(size int) (*Pool, error) {
+	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, true)
+}
+
+// NewUltimatePool 初始化协程池，需指定协程池大小，并且定义不活跃线程的清理时间
+func NewUltimatePool(size, expiry int, preAlloc bool) (*Pool, error) {
+	if size <= 0 {
+		return nil, ErrInvalidPoolSize
+	}
+	if expiry <= 0 {
+		return nil, ErrInvalidPoolExpiry
+	}
+	var p *Pool
+	if preAlloc {
+		p = &Pool{
+			capacity:       int32(size),
+			expiryDuration: time.Duration(expiry) * time.Second,
+			workers:        make([]*Worker, 0, size), // 预分配内存
+		}
+	} else {
+		p = &Pool{
+			capacity:       int32(size),
+			expiryDuration: time.Duration(expiry) * time.Second,
+		}
+	}
+	p.cond = sync.NewCond(&p.lock)
+	// 协程清理空闲执行器
+	go p.periodicallyPurge()
+	return p, nil
 }
 
 // Submit 提交任务到协程池中
@@ -103,9 +108,19 @@ func (p *Pool) Submit(task func()) error {
 	return nil
 }
 
+// Running 返回当前正在运行中的线程数
+func (p *Pool) Running() int {
+	return int(atomic.LoadInt32(&p.running))
+}
+
 // Free 返回可用的线程数
 func (p *Pool) Free() int {
 	return int(atomic.LoadInt32(&p.capacity) - atomic.LoadInt32(&p.running))
+}
+
+// Cap 返回协程池的容量
+func (p *Pool) Cap() int {
+	return int(atomic.LoadInt32(&p.capacity))
 }
 
 // Tune 动态改变协程池大小
@@ -122,6 +137,7 @@ func (p *Pool) Tune(size int) {
 
 // Release 关闭协程池
 func (p *Pool) Release() error {
+	// 使用 sync.Once 方法为了关闭安全，协程池只需要关闭一次即可
 	p.once.Do(func() {
 		atomic.StoreInt32(&p.release, 1)
 		p.lock.Lock()
@@ -136,27 +152,20 @@ func (p *Pool) Release() error {
 	return nil
 }
 
-// Running 返回当前正在运行中的线程数
-func (p *Pool) Running() int {
-	return int(atomic.LoadInt32(&p.running))
+// incrRunning 正在运行的线程数+1
+func (p *Pool) incrRunning() {
+	atomic.AddInt32(&p.running, 1)
+}
+
+// decRunning 正在运行的线程数-1
+func (p *Pool) decRunning() {
+	atomic.AddInt32(&p.running, -1)
 }
 
 // retrieveWorker 分配可用执行器执行任务
 func (p *Pool) retrieveWorker() *Worker {
 	var w *Worker
-	p.lock.Lock()
-	idleWorkers := p.workers
-	n := len(idleWorkers) - 1
-	// 如果n大于0，先分配可用执行器
-	if n >= 0 {
-		// 未销户的执行器，其内部进程还在继续运行
-		w = idleWorkers[n]
-		idleWorkers[n] = nil
-		p.workers = idleWorkers[:n]
-		p.lock.Unlock()
-	} else if p.Running() < p.Cap() {
-		// 真正分配并运行任务的执行器
-		p.lock.Unlock()
+	spawnWorker := func() {
 		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
 			w = cacheWorker.(*Worker)
 		} else {
@@ -165,11 +174,30 @@ func (p *Pool) retrieveWorker() *Worker {
 				task: make(chan func(), workChanCap()),
 			}
 		}
-		// 任务真正开始执行
 		w.run()
+	}
+	p.lock.Lock()
+	idleWorkers := p.workers
+	n := len(idleWorkers) - 1
+	// 如果n大于0，先分配可用执行器
+	if n >= 0 {
+		// 未销毁的执行器，其内部进程还在继续运行
+		w = idleWorkers[n]
+		idleWorkers[n] = nil
+		p.workers = idleWorkers[:n]
+		p.lock.Unlock()
+	} else if p.Running() < p.Cap() {
+		// 真正分配并运行任务的执行器
+		p.lock.Unlock()
+		spawnWorker()
 	} else {
 	Reentry:
 		p.cond.Wait()
+		if p.Running() == 0 {
+			p.lock.Unlock()
+			spawnWorker()
+			return w
+		}
 		l := len(p.workers) - 1
 		if l < 0 {
 			goto Reentry
@@ -180,21 +208,6 @@ func (p *Pool) retrieveWorker() *Worker {
 		p.lock.Unlock()
 	}
 	return w
-}
-
-// Cap 返回协程池的容量
-func (p *Pool) Cap() int {
-	return int(atomic.LoadInt32(&p.capacity))
-}
-
-// incrRunning 正在运行的线程数+1
-func (p *Pool) incrRunning() {
-	atomic.AddInt32(&p.running, 1)
-}
-
-// decRunning 正在运行的线程数-1
-func (p *Pool) decRunning() {
-	atomic.AddInt32(&p.running, -1)
 }
 
 // revertWorker 归还执行器入协程池中
