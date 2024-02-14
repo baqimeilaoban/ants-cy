@@ -20,6 +20,7 @@ var (
 
 var (
 	workChanCap = func() int {
+		// 判断是否可以并行执行多任务
 		if runtime.GOMAXPROCS(0) == 1 {
 			return 0
 		}
@@ -34,6 +35,11 @@ func Submit(task func()) error {
 	return defaultAntsPool.Submit(task)
 }
 
+// Running 获取默认线程池中正在运行的线程
+func Running() int {
+	return defaultAntsPool.Running()
+}
+
 // Cap 默认协程池大小
 func Cap() int {
 	return defaultAntsPool.Cap()
@@ -45,6 +51,6 @@ func Free() int {
 }
 
 // Release 关闭默认线程池
-func Release()  {
-	_ =defaultAntsPool.Release()
+func Release() {
+	_ = defaultAntsPool.Release()
 }

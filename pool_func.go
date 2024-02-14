@@ -42,6 +42,7 @@ func (p *PoolWithFunc) periodicallyPurge() {
 		// 已过期待删除执行器
 		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
 		if i > 0 {
+			// 复制还未过期的执行器
 			m := copy(idleWorkers, idleWorkers[i:])
 			for i := m; i < n; i++ {
 				idleWorkers[i] = nil
@@ -52,6 +53,9 @@ func (p *PoolWithFunc) periodicallyPurge() {
 		for i, w := range expiredWorkers {
 			w.args <- nil
 			expiredWorkers[i] = nil
+		}
+		if p.Running() == 0 {
+			p.cond.Broadcast()
 		}
 	}
 }
@@ -68,10 +72,10 @@ func NewPoolWithFuncPreMalloc(size int, pf func(interface{})) (*PoolWithFunc, er
 
 // NewUltimatePoolWithFunc 初始化协程池，指定size/expiry/pf
 func NewUltimatePoolWithFunc(size, expiry int, pf func(interface{}), preMalloc bool) (*PoolWithFunc, error) {
-	if size < 0 {
+	if size <= 0 {
 		return nil, ErrInvalidPoolSize
 	}
-	if expiry < 0 {
+	if expiry <= 0 {
 		return nil, ErrInvalidPoolExpiry
 	}
 	var p *PoolWithFunc
@@ -159,6 +163,17 @@ func (p *PoolWithFunc) decRunning() {
 // retrieveWorker 分配可用的执行器执行任务
 func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 	var w *WorkWithFunc
+	spawnWorker := func() {
+		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
+			w = cacheWorker.(*WorkWithFunc)
+		} else {
+			w = &WorkWithFunc{
+				pool: p,
+				args: make(chan interface{}, workChanCap()),
+			}
+		}
+		w.run()
+	}
 	p.lock.Lock()
 	idleWorkers := p.workers
 	n := len(idleWorkers) - 1
@@ -169,18 +184,15 @@ func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 		p.lock.Unlock()
 	} else if p.Running() < p.Cap() {
 		p.lock.Unlock()
-		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
-			w = cacheWorker.(*WorkWithFunc)
-		} else {
-			w = &WorkWithFunc{
-				pool: p,
-				args: make(chan interface{}, workChanCap()),
-			}
-		}
-		w.run()
+		spawnWorker()
 	} else {
 	Reentry:
 		p.cond.Wait()
+		if p.Running() == 0 {
+			p.lock.Unlock()
+			spawnWorker()
+			return w
+		}
 		l := len(p.workers) - 1
 		if l < 0 {
 			goto Reentry
