@@ -22,20 +22,34 @@ type Pool struct {
 
 // NewPool 初始化协程池，需指定协程池大小
 func NewPool(size int) (*Pool, error) {
-	return NewTimingPool(size, DEFAULT_CLEAN_INERVAL_TIME)
+	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, false)
 }
 
-// NewTimingPool 初始化协程池，需指定协程池大小，并且定义不活跃线程的清理时间
-func NewTimingPool(size, expiry int) (*Pool, error) {
+// NewPoolPreMalloc 创建预分配空间的协程池
+func NewPoolPreMalloc(size int) (*Pool, error) {
+	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, true)
+}
+
+// NewUltimatePool 初始化协程池，需指定协程池大小，并且定义不活跃线程的清理时间
+func NewUltimatePool(size, expiry int, preAlloc bool) (*Pool, error) {
 	if size < 0 {
 		return nil, ErrInvalidPoolSize
 	}
 	if expiry < 0 {
 		return nil, ErrInvalidPoolExpiry
 	}
-	p := &Pool{
-		capacity:       int32(size),
-		expiryDuration: time.Duration(expiry) * time.Second,
+	var p *Pool
+	if preAlloc {
+		p = &Pool{
+			capacity:       int32(size),
+			expiryDuration: time.Duration(expiry) * time.Second,
+			workers:        make([]*Worker, 0, size), // 预分配内存
+		}
+	} else {
+		p = &Pool{
+			capacity:       int32(size),
+			expiryDuration: time.Duration(expiry) * time.Second,
+		}
 	}
 	p.cond = sync.NewCond(&p.lock)
 	// 协程清理空闲执行器
@@ -135,11 +149,13 @@ func (p *Pool) retrieveWorker() *Worker {
 	n := len(idleWorkers) - 1
 	// 如果n大于0，先分配可用执行器
 	if n >= 0 {
+		// 未销户的执行器，其内部进程还在继续运行
 		w = idleWorkers[n]
 		idleWorkers[n] = nil
 		p.workers = idleWorkers[:n]
 		p.lock.Unlock()
 	} else if p.Running() < p.Cap() {
+		// 真正分配并运行任务的执行器
 		p.lock.Unlock()
 		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
 			w = cacheWorker.(*Worker)
@@ -152,18 +168,15 @@ func (p *Pool) retrieveWorker() *Worker {
 		// 任务真正开始执行
 		w.run()
 	} else {
-		for {
-			// 当前线程睡眠，等待其他线程唤醒
-			p.cond.Wait()
-			l := len(p.workers) - 1
-			if l < 0 {
-				continue
-			}
-			w = p.workers[l]
-			p.workers[l] = nil
-			p.workers = p.workers[:l]
-			break
+	Reentry:
+		p.cond.Wait()
+		l := len(p.workers) - 1
+		if l < 0 {
+			goto Reentry
 		}
+		w = p.workers[l]
+		p.workers[l] = nil
+		p.workers = p.workers[:l]
 		p.lock.Unlock()
 	}
 	return w

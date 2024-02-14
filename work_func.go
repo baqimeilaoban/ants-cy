@@ -2,6 +2,7 @@ package ants_cy
 
 import (
 	"log"
+	"runtime"
 	"time"
 )
 
@@ -25,6 +26,9 @@ func (w *WorkWithFunc) run() {
 					w.pool.PanicHandler(p)
 				} else {
 					log.Printf("worker exit from panic:%v", p)
+					var buf [4096]byte
+					n := runtime.Stack(buf[:], false)
+					log.Printf("worker with fun exits from panic:%s\n", string(buf[:n]))
 				}
 			}
 		}()

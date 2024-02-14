@@ -2,6 +2,7 @@ package ants_cy
 
 import (
 	"log"
+	"runtime"
 	"time"
 )
 
@@ -24,7 +25,11 @@ func (w *Worker) run() {
 				if w.pool.PanicHandler != nil {
 					w.pool.PanicHandler(p)
 				} else {
+					// 新增panic打印的堆栈信息
 					log.Printf("执行器存在panic:%v", p)
+					var buf [4096]byte
+					n := runtime.Stack(buf[:], false)
+					log.Printf("执行器panic位置如下:%s\n", string(buf[:n]))
 				}
 			}
 		}()
