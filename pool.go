@@ -8,16 +8,19 @@ import (
 
 // Pool 协程池定义。该协程池接受来自客户端的任务，并且其能限制线程数量
 type Pool struct {
-	capacity       int32             // 协程池容量
-	running        int32             // 协程池中活跃线程
-	expiryDuration time.Duration     // 不活跃线程的清理时间
-	workers        []*Worker         // 用于存储可用执行器的切片
-	release        int32             // 用于通知协程池关闭
-	lock           sync.Mutex        // 锁，保证并发安全
-	cond           *sync.Cond        // 等待空闲执行器
-	once           sync.Once         // 保证协程池的关闭只执行一次
-	workCache      sync.Pool         // 用于加速获取可用执行器，引入golang的缓存池
-	PanicHandler   func(interface{}) // 用于捕捉panic
+	capacity         int32             // 协程池容量
+	running          int32             // 协程池中活跃线程
+	expiryDuration   time.Duration     // 不活跃线程的清理时间
+	workers          []*Worker         // 用于存储可用执行器的切片
+	release          int32             // 用于通知协程池关闭
+	lock             sync.Mutex        // 锁，保证并发安全
+	cond             *sync.Cond        // 等待空闲执行器
+	once             sync.Once         // 保证协程池的关闭只执行一次
+	workCache        sync.Pool         // 用于加速获取可用执行器，引入golang的缓存池
+	PanicHandler     func(interface{}) // 用于捕捉panic
+	MaxBlockingTasks int32             // 最大允许提交的任务，0意味着没有限制
+	blockingNum      int32             // 被阻塞的任务数
+	Nonblocking      bool              // 是否运行被阻塞，若为 true，则超限后，会返回 ErrPoolOverload 错误
 }
 
 // periodicallyPurge 定时清理过期执行器
@@ -104,7 +107,11 @@ func (p *Pool) Submit(task func()) error {
 	if CLOSE == atomic.LoadInt32(&p.release) {
 		return ErrPoolClosed
 	}
-	p.retrieveWorker().task <- task
+	if w := p.retrieveWorker(); w == nil {
+		return ErrPoolOverload
+	} else {
+		w.task <- task
+	}
 	return nil
 }
 
@@ -191,8 +198,19 @@ func (p *Pool) retrieveWorker() *Worker {
 		p.lock.Unlock()
 		spawnWorker()
 	} else {
+		if p.Nonblocking {
+			p.lock.Unlock()
+			return nil
+		}
 	Reentry:
+		// 允许的最大阻塞长度，若是最大阻塞长度为0，则表示每个任务均阻塞
+		if p.MaxBlockingTasks != 0 && p.blockingNum >= p.MaxBlockingTasks {
+			p.lock.Unlock()
+			return nil
+		}
+		p.blockingNum++
 		p.cond.Wait()
+		p.blockingNum--
 		if p.Running() == 0 {
 			p.lock.Unlock()
 			spawnWorker()

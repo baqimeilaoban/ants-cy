@@ -16,6 +16,7 @@ var (
 	ErrInvalidPoolSize   = errors.New("协程数量无效")
 	ErrInvalidPoolExpiry = errors.New("线程无效清理时间")
 	ErrPoolClosed        = errors.New("协程池已被关闭")
+	ErrPoolOverload      = errors.New("协程池已过载")
 )
 
 var (
