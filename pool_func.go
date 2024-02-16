@@ -19,6 +19,9 @@ type PoolWithFunc struct {
 	once           sync.Once         // 保证该线程池只会被关闭一次
 	workCache      sync.Pool         // 提高性能，利用pool暂存数据
 	PanicHandler   func(interface{}) // panic后的处理方法
+	MaxBlockTasks  int32             // 最大阻塞任务数量
+	blockingNum    int32             // 当前正阻塞任务数量
+	NonBlocking    bool              // 是否允许任务阻塞
 }
 
 // periodicallyPurge 定期清理不活跃执行器
@@ -103,7 +106,11 @@ func (p *PoolWithFunc) Invoke(args interface{}) error {
 	if CLOSE == atomic.LoadInt32(&p.release) {
 		return ErrPoolClosed
 	}
-	p.retrieveWorker().args <- args
+	if w := p.retrieveWorker(); w == nil {
+		return ErrPoolOverload
+	} else {
+		w.args <- args
+	}
 	return nil
 }
 
@@ -186,7 +193,15 @@ func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 		p.lock.Unlock()
 		spawnWorker()
 	} else {
+		if p.NonBlocking {
+			p.lock.Unlock()
+			return nil
+		}
 	Reentry:
+		if p.MaxBlockTasks != 0 && p.blockingNum >= p.MaxBlockTasks {
+			p.lock.Unlock()
+			return nil
+		}
 		p.cond.Wait()
 		if p.Running() == 0 {
 			p.lock.Unlock()
