@@ -8,27 +8,27 @@ import (
 
 // PoolWithFunc 自带函数处理的协程池
 type PoolWithFunc struct {
-	capacity       int32             // 协程池容量
-	running        int32             // 运行中的线程
-	expiryDuration time.Duration     // 不活跃线程的清理时间
-	workers        []*WorkWithFunc   // 执行器列表
-	release        int32             // 是否清理协程池
-	lock           sync.Mutex        // 锁，保证并发安全
-	cond           *sync.Cond        // 等待获取空闲执行器，用于线程间通信
-	poolFunc       func(interface{}) // 执行任务的方法
-	once           sync.Once         // 保证该线程池只会被关闭一次
-	workCache      sync.Pool         // 提高性能，利用pool暂存数据
-	PanicHandler   func(interface{}) // panic后的处理方法
-	MaxBlockTasks  int32             // 最大阻塞任务数量
-	blockingNum    int32             // 当前正阻塞任务数量
-	NonBlocking    bool              // 是否允许任务阻塞
+	capacity         int32             // 协程池容量
+	running          int32             // 运行中的线程
+	expiryDuration   time.Duration     // 不活跃线程的清理时间
+	workers          []*goWorkWithFunc // 执行器列表
+	release          int32             // 是否清理协程池
+	lock             sync.Mutex        // 锁，保证并发安全
+	cond             *sync.Cond        // 等待获取空闲执行器，用于线程间通信
+	poolFunc         func(interface{}) // 执行任务的方法
+	once             sync.Once         // 保证该线程池只会被关闭一次
+	workCache        sync.Pool         // 提高性能，利用pool暂存数据
+	panicHandler     func(interface{}) // panic后的处理方法
+	maxBlockingTasks int32             // 最大阻塞任务数量
+	blockingNum      int32             // 当前正阻塞任务数量
+	nonblocking      bool              // 是否允许任务阻塞
 }
 
 // periodicallyPurge 定期清理不活跃执行器
 func (p *PoolWithFunc) periodicallyPurge() {
 	heatBeat := time.NewTicker(p.expiryDuration)
 	defer heatBeat.Stop()
-	var expiredWorkers []*WorkWithFunc
+	var expiredWorkers []*goWorkWithFunc
 	for range heatBeat.C {
 		// 若是线程池已经被关闭，则直接退出清理，释放空间
 		if CLOSE == atomic.LoadInt32(&p.release) {
@@ -38,9 +38,8 @@ func (p *PoolWithFunc) periodicallyPurge() {
 		p.lock.Lock()
 		idleWorkers := p.workers
 		n := len(idleWorkers)
-		i := 0
-		for i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration {
-			i++
+		var i int
+		for i = 0; i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration; i++ {
 		}
 		// 已过期待删除执行器
 		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
@@ -64,37 +63,32 @@ func (p *PoolWithFunc) periodicallyPurge() {
 }
 
 // NewPoolWithFunc 初始化协程池
-func NewPoolWithFunc(size int, pf func(interface{})) (*PoolWithFunc, error) {
-	return NewUltimatePoolWithFunc(size, DEFAULT_CLEAN_INERVAL_TIME, pf, false)
-}
-
-// NewPoolWithFuncPreMalloc 初始化协程池，预先分配内存
-func NewPoolWithFuncPreMalloc(size int, pf func(interface{})) (*PoolWithFunc, error) {
-	return NewUltimatePoolWithFunc(size, DEFAULT_CLEAN_INERVAL_TIME, pf, true)
-}
-
-// NewUltimatePoolWithFunc 初始化协程池，指定size/expiry/pf
-func NewUltimatePoolWithFunc(size, expiry int, pf func(interface{}), preMalloc bool) (*PoolWithFunc, error) {
+func NewPoolWithFunc(size int, pf func(interface{}), options ...Option) (*PoolWithFunc, error) {
 	if size <= 0 {
 		return nil, ErrInvalidPoolSize
 	}
-	if expiry <= 0 {
-		return nil, ErrInvalidPoolExpiry
+	if pf == nil {
+		return nil, ErrLackPoolFunc
 	}
-	var p *PoolWithFunc
-	if preMalloc {
-		p = &PoolWithFunc{
-			capacity:       int32(size),
-			expiryDuration: time.Duration(expiry) * time.Second,
-			workers:        make([]*WorkWithFunc, 0, size),
-			poolFunc:       pf,
-		}
-	} else {
-		p = &PoolWithFunc{
-			capacity:       int32(size),
-			expiryDuration: time.Duration(expiry) * time.Second,
-			poolFunc:       pf,
-		}
+	opts := new(Options)
+	for _, option := range options {
+		option(opts)
+	}
+	if expiry := opts.ExpiryDuration; expiry < 0 {
+		return nil, ErrInvalidPoolExpiry
+	} else if expiry == 0 {
+		opts.ExpiryDuration = time.Duration(DEFAULT_CLEAN_INERVAL_TIME) * time.Second
+	}
+	p := &PoolWithFunc{
+		capacity:         int32(size),
+		expiryDuration:   opts.ExpiryDuration,
+		poolFunc:         pf,
+		panicHandler:     opts.PanicHandler,
+		maxBlockingTasks: int32(opts.MaxBlockingTasks),
+		nonblocking:      opts.Nonblocking,
+	}
+	if opts.PreAlloc {
+		p.workers = make([]*goWorkWithFunc, 0, size)
 	}
 	p.cond = sync.NewCond(&p.lock)
 	go p.periodicallyPurge()
@@ -135,14 +129,10 @@ func (p *PoolWithFunc) Tune(size int) {
 		return
 	}
 	atomic.StoreInt32(&p.capacity, int32(size))
-	diff := p.Running() - size
-	for i := 0; i < diff; i++ {
-		p.retrieveWorker().args <- nil
-	}
 }
 
 // Release 关闭线程池
-func (p *PoolWithFunc) Release() error {
+func (p *PoolWithFunc) Release() {
 	p.once.Do(func() {
 		atomic.StoreInt32(&p.release, 1)
 		p.lock.Lock()
@@ -154,7 +144,6 @@ func (p *PoolWithFunc) Release() error {
 		p.workers = nil
 		p.lock.Unlock()
 	})
-	return nil
 }
 
 // incRunning 活跃线程数+1
@@ -168,13 +157,13 @@ func (p *PoolWithFunc) decRunning() {
 }
 
 // retrieveWorker 分配可用的执行器执行任务
-func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
-	var w *WorkWithFunc
+func (p *PoolWithFunc) retrieveWorker() *goWorkWithFunc {
+	var w *goWorkWithFunc
 	spawnWorker := func() {
 		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
-			w = cacheWorker.(*WorkWithFunc)
+			w = cacheWorker.(*goWorkWithFunc)
 		} else {
-			w = &WorkWithFunc{
+			w = &goWorkWithFunc{
 				pool: p,
 				args: make(chan interface{}, workChanCap()),
 			}
@@ -193,16 +182,19 @@ func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 		p.lock.Unlock()
 		spawnWorker()
 	} else {
-		if p.NonBlocking {
+		if p.nonblocking {
 			p.lock.Unlock()
 			return nil
 		}
 	Reentry:
-		if p.MaxBlockTasks != 0 && p.blockingNum >= p.MaxBlockTasks {
+		if p.maxBlockingTasks != 0 && p.blockingNum >= p.maxBlockingTasks {
 			p.lock.Unlock()
 			return nil
 		}
+		p.blockingNum++
 		p.cond.Wait()
+		p.blockingNum--
+		// 若是现在待运行的执行器为0，那么直接生产一个即可，若是不直接生成一个，极端情况下会卡住
 		if p.Running() == 0 {
 			p.lock.Unlock()
 			spawnWorker()
@@ -221,8 +213,8 @@ func (p *PoolWithFunc) retrieveWorker() *WorkWithFunc {
 }
 
 // 将执行器放回协程池中，并更新过期刷新时间
-func (p *PoolWithFunc) revertWorker(worker *WorkWithFunc) bool {
-	if CLOSE == atomic.LoadInt32(&p.release) {
+func (p *PoolWithFunc) revertWorker(worker *goWorkWithFunc) bool {
+	if CLOSE == atomic.LoadInt32(&p.release) || p.Running() > p.Cap() {
 		return false
 	}
 	worker.recycleTime = time.Now()
