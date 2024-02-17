@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"runtime"
+	"time"
 )
 
 const (
@@ -17,6 +18,7 @@ var (
 	ErrInvalidPoolExpiry = errors.New("线程无效清理时间")
 	ErrPoolClosed        = errors.New("协程池已被关闭")
 	ErrPoolOverload      = errors.New("协程池已过载")
+	ErrLackPoolFunc      = errors.New("协程池中必须提供函数")
 )
 
 var (
@@ -30,6 +32,60 @@ var (
 	// 引入包时直接初始化一个
 	defaultAntsPool, _ = NewPool(DEFAULT_ANTS_POOL_SIZE)
 )
+
+// Options 引入option参数
+type Options struct {
+	ExpiryDuration   time.Duration     // 不活跃线程的清理时间
+	PreAlloc         bool              // 是否需要提前为执行器分配内存
+	MaxBlockingTasks int               // 最大允许提交的任务，0意味着没有限制
+	Nonblocking      bool              // 是否运行被阻塞，若为 true，则超限后，会返回 ErrPoolOverload 错误
+	PanicHandler     func(interface{}) // 用于捕捉panic
+}
+
+// Option Option函数
+type Option func(opts *Options)
+
+// WithOptions 构造options函数
+func WithOptions(options Options) Option {
+	return func(opts *Options) {
+		*opts = options
+	}
+}
+
+// WithExpiryDuration 构造清理不活跃线程的清理时间
+func WithExpiryDuration(expiryDuration time.Duration) Option {
+	return func(opts *Options) {
+		opts.ExpiryDuration = expiryDuration
+	}
+}
+
+// WithPreAlloc 构造是否提前分配内存的函数
+func WithPreAlloc(preAlloc bool) Option {
+	return func(opts *Options) {
+		opts.PreAlloc = preAlloc
+	}
+}
+
+// WithMaxBlockingTasks 构造最大允许提交任务的函数
+func WithMaxBlockingTasks(maxBlockingTasks int) Option {
+	return func(opts *Options) {
+		opts.MaxBlockingTasks = maxBlockingTasks
+	}
+}
+
+// WithNonblocking 构造是否允许阻塞的函数
+func WithNonblocking(nonblocking bool) Option {
+	return func(opts *Options) {
+		opts.Nonblocking = nonblocking
+	}
+}
+
+// WithPanicHandler 构造panic后的处理函数
+func WithPanicHandler(panicHandler func(interface{})) Option {
+	return func(opts *Options) {
+		opts.PanicHandler = panicHandler
+	}
+}
 
 // Submit 提交一个任务到协程池
 func Submit(task func()) error {
@@ -53,5 +109,5 @@ func Free() int {
 
 // Release 关闭默认线程池
 func Release() {
-	_ = defaultAntsPool.Release()
+	defaultAntsPool.Release()
 }

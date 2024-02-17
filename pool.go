@@ -11,16 +11,16 @@ type Pool struct {
 	capacity         int32             // 协程池容量
 	running          int32             // 协程池中活跃线程
 	expiryDuration   time.Duration     // 不活跃线程的清理时间
-	workers          []*Worker         // 用于存储可用执行器的切片
+	workers          []*goWorker       // 用于存储可用执行器的切片
 	release          int32             // 用于通知协程池关闭
 	lock             sync.Mutex        // 锁，保证并发安全
 	cond             *sync.Cond        // 等待空闲执行器
 	once             sync.Once         // 保证协程池的关闭只执行一次
 	workCache        sync.Pool         // 用于加速获取可用执行器，引入golang的缓存池
-	PanicHandler     func(interface{}) // 用于捕捉panic
-	MaxBlockingTasks int32             // 最大允许提交的任务，0意味着没有限制
+	panicHandler     func(interface{}) // 用于捕捉panic
+	maxBlockingTasks int32             // 最大允许提交的任务，0意味着没有限制
 	blockingNum      int32             // 被阻塞的任务数
-	Nonblocking      bool              // 是否运行被阻塞，若为 true，则超限后，会返回 ErrPoolOverload 错误
+	nonblocking      bool              // 是否运行被阻塞，若为 true，则超限后，会返回 ErrPoolOverload 错误
 }
 
 // periodicallyPurge 定时清理过期执行器
@@ -28,7 +28,7 @@ func (p *Pool) periodicallyPurge() {
 	// 初始化定时器
 	heatBeat := time.NewTicker(p.expiryDuration)
 	defer heatBeat.Stop()
-	var expiredWorkers []*Worker
+	var expiredWorkers []*goWorker
 	for range heatBeat.C {
 		// 原子方式加载值，安全
 		if CLOSE == atomic.LoadInt32(&p.release) {
@@ -39,9 +39,8 @@ func (p *Pool) periodicallyPurge() {
 		// 空闲执行器
 		idleWorkers := p.workers
 		n := len(idleWorkers)
-		i := 0
-		for i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration {
-			i++
+		var i int
+		for i = 0; i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration; i++ {
 		}
 		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
 		if i > 0 {
@@ -65,35 +64,28 @@ func (p *Pool) periodicallyPurge() {
 }
 
 // NewPool 初始化协程池，需指定协程池大小
-func NewPool(size int) (*Pool, error) {
-	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, false)
-}
-
-// NewPoolPreMalloc 创建预分配空间的协程池
-func NewPoolPreMalloc(size int) (*Pool, error) {
-	return NewUltimatePool(size, DEFAULT_CLEAN_INERVAL_TIME, true)
-}
-
-// NewUltimatePool 初始化协程池，需指定协程池大小，并且定义不活跃线程的清理时间
-func NewUltimatePool(size, expiry int, preAlloc bool) (*Pool, error) {
+func NewPool(size int, options ...Option) (*Pool, error) {
 	if size <= 0 {
 		return nil, ErrInvalidPoolSize
 	}
-	if expiry <= 0 {
-		return nil, ErrInvalidPoolExpiry
+	opts := new(Options)
+	for _, option := range options {
+		option(opts)
 	}
-	var p *Pool
-	if preAlloc {
-		p = &Pool{
-			capacity:       int32(size),
-			expiryDuration: time.Duration(expiry) * time.Second,
-			workers:        make([]*Worker, 0, size), // 预分配内存
-		}
-	} else {
-		p = &Pool{
-			capacity:       int32(size),
-			expiryDuration: time.Duration(expiry) * time.Second,
-		}
+	if expiry := opts.ExpiryDuration; expiry < 0 {
+		return nil, ErrInvalidPoolExpiry
+	} else if expiry == 0 {
+		opts.ExpiryDuration = time.Duration(DEFAULT_CLEAN_INERVAL_TIME) * time.Second
+	}
+	p := &Pool{
+		capacity:         int32(size),
+		expiryDuration:   opts.ExpiryDuration,
+		panicHandler:     opts.PanicHandler,
+		maxBlockingTasks: int32(opts.MaxBlockingTasks),
+		nonblocking:      opts.Nonblocking,
+	}
+	if opts.PreAlloc {
+		p.workers = make([]*goWorker, 0, size)
 	}
 	p.cond = sync.NewCond(&p.lock)
 	// 协程清理空闲执行器
@@ -136,14 +128,10 @@ func (p *Pool) Tune(size int) {
 		return
 	}
 	atomic.StoreInt32(&p.capacity, int32(size))
-	diff := p.Running() - size
-	for i := 0; i < diff; i++ {
-		p.retrieveWorker().task <- nil
-	}
 }
 
 // Release 关闭协程池
-func (p *Pool) Release() error {
+func (p *Pool) Release() {
 	// 使用 sync.Once 方法为了关闭安全，协程池只需要关闭一次即可
 	p.once.Do(func() {
 		atomic.StoreInt32(&p.release, 1)
@@ -156,7 +144,6 @@ func (p *Pool) Release() error {
 		p.workers = nil
 		p.lock.Unlock()
 	})
-	return nil
 }
 
 // incrRunning 正在运行的线程数+1
@@ -170,13 +157,13 @@ func (p *Pool) decRunning() {
 }
 
 // retrieveWorker 分配可用执行器执行任务
-func (p *Pool) retrieveWorker() *Worker {
-	var w *Worker
+func (p *Pool) retrieveWorker() *goWorker {
+	var w *goWorker
 	spawnWorker := func() {
 		if cacheWorker := p.workCache.Get(); cacheWorker != nil {
-			w = cacheWorker.(*Worker)
+			w = cacheWorker.(*goWorker)
 		} else {
-			w = &Worker{
+			w = &goWorker{
 				pool: p,
 				task: make(chan func(), workChanCap()),
 			}
@@ -198,13 +185,13 @@ func (p *Pool) retrieveWorker() *Worker {
 		p.lock.Unlock()
 		spawnWorker()
 	} else {
-		if p.Nonblocking {
+		if p.nonblocking {
 			p.lock.Unlock()
 			return nil
 		}
 	Reentry:
 		// 允许的最大阻塞长度，若是最大阻塞长度为0，则表示每个任务均阻塞
-		if p.MaxBlockingTasks != 0 && p.blockingNum >= p.MaxBlockingTasks {
+		if p.maxBlockingTasks != 0 && p.blockingNum >= p.maxBlockingTasks {
 			p.lock.Unlock()
 			return nil
 		}
@@ -229,8 +216,9 @@ func (p *Pool) retrieveWorker() *Worker {
 }
 
 // revertWorker 归还执行器入协程池中
-func (p *Pool) revertWorker(worker *Worker) bool {
-	if CLOSE == atomic.LoadInt32(&p.release) {
+func (p *Pool) revertWorker(worker *goWorker) bool {
+	// 若是正在运行的线程数大于最大线程数，则该执行器退出，等待清理
+	if CLOSE == atomic.LoadInt32(&p.release) || p.Running() > p.Cap() {
 		return false
 	}
 	worker.recycleTime = time.Now()
