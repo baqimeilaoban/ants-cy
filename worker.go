@@ -19,8 +19,8 @@ func (w *goWorker) run() {
 	go func() {
 		// 捕获异常
 		defer func() {
+			w.pool.decRunning()
 			if p := recover(); p != nil {
-				w.pool.decRunning()
 				w.pool.workCache.Put(w)
 				if w.pool.panicHandler != nil {
 					w.pool.panicHandler(p)
@@ -32,16 +32,15 @@ func (w *goWorker) run() {
 					log.Printf("执行器panic位置如下:%s\n", string(buf[:n]))
 				}
 			}
+			w.pool.workCache.Put(w)
 		}()
 		for f := range w.task {
 			if nil == f {
-				w.pool.decRunning()
-				w.pool.workCache.Put(w)
 				return
 			}
 			f()
 			if ok := w.pool.revertWorker(w); !ok {
-				break
+				return
 			}
 		}
 	}()

@@ -13,7 +13,7 @@ type PoolWithFunc struct {
 	expiryDuration   time.Duration     // 不活跃线程的清理时间
 	workers          []*goWorkWithFunc // 执行器列表
 	release          int32             // 是否清理协程池
-	lock             sync.Mutex        // 锁，保证并发安全
+	lock             sync.Locker       // 锁，保证并发安全
 	cond             *sync.Cond        // 等待获取空闲执行器，用于线程间通信
 	poolFunc         func(interface{}) // 执行任务的方法
 	once             sync.Once         // 保证该线程池只会被关闭一次
@@ -38,8 +38,9 @@ func (p *PoolWithFunc) periodicallyPurge() {
 		p.lock.Lock()
 		idleWorkers := p.workers
 		n := len(idleWorkers)
-		var i int
-		for i = 0; i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration; i++ {
+		i := 0
+		for i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration {
+			i++
 		}
 		// 已过期待删除执行器
 		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
@@ -86,11 +87,12 @@ func NewPoolWithFunc(size int, pf func(interface{}), options ...Option) (*PoolWi
 		panicHandler:     opts.PanicHandler,
 		maxBlockingTasks: int32(opts.MaxBlockingTasks),
 		nonblocking:      opts.Nonblocking,
+		lock:             SpinLock(),
 	}
 	if opts.PreAlloc {
 		p.workers = make([]*goWorkWithFunc, 0, size)
 	}
-	p.cond = sync.NewCond(&p.lock)
+	p.cond = sync.NewCond(p.lock)
 	go p.periodicallyPurge()
 	return p, nil
 }
