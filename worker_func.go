@@ -18,10 +18,8 @@ func (w *goWorkWithFunc) run() {
 	w.pool.incRunning()
 	go func() {
 		defer func() {
+			w.pool.decRunning()
 			if p := recover(); p != nil {
-				w.pool.decRunning()
-				// 归还到缓存池中
-				w.pool.workCache.Put(w)
 				if w.pool.panicHandler != nil {
 					w.pool.panicHandler(p)
 				} else {
@@ -31,16 +29,16 @@ func (w *goWorkWithFunc) run() {
 					log.Printf("worker with fun exits from panic:%s\n", string(buf[:n]))
 				}
 			}
+			// 归还到缓存池中
+			w.pool.workCache.Put(w)
 		}()
 		for args := range w.args {
 			if nil == args {
-				w.pool.decRunning()
-				w.pool.workCache.Put(w)
 				return
 			}
 			w.pool.poolFunc(args)
 			if ok := w.pool.revertWorker(w); !ok {
-				break
+				return
 			}
 		}
 	}()

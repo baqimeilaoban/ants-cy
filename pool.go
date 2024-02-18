@@ -13,7 +13,7 @@ type Pool struct {
 	expiryDuration   time.Duration     // 不活跃线程的清理时间
 	workers          []*goWorker       // 用于存储可用执行器的切片
 	release          int32             // 用于通知协程池关闭
-	lock             sync.Mutex        // 锁，保证并发安全
+	lock             sync.Locker       // 锁，保证并发安全
 	cond             *sync.Cond        // 等待空闲执行器
 	once             sync.Once         // 保证协程池的关闭只执行一次
 	workCache        sync.Pool         // 用于加速获取可用执行器，引入golang的缓存池
@@ -39,8 +39,9 @@ func (p *Pool) periodicallyPurge() {
 		// 空闲执行器
 		idleWorkers := p.workers
 		n := len(idleWorkers)
-		var i int
-		for i = 0; i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration; i++ {
+		i := 0
+		for i < n && currentTime.Sub(idleWorkers[i].recycleTime) > p.expiryDuration {
+			i++
 		}
 		expiredWorkers = append(expiredWorkers[:0], idleWorkers[:i]...)
 		if i > 0 {
@@ -83,11 +84,12 @@ func NewPool(size int, options ...Option) (*Pool, error) {
 		panicHandler:     opts.PanicHandler,
 		maxBlockingTasks: int32(opts.MaxBlockingTasks),
 		nonblocking:      opts.Nonblocking,
+		lock:             SpinLock(),
 	}
 	if opts.PreAlloc {
 		p.workers = make([]*goWorker, 0, size)
 	}
-	p.cond = sync.NewCond(&p.lock)
+	p.cond = sync.NewCond(p.lock)
 	// 协程清理空闲执行器
 	go p.periodicallyPurge()
 	return p, nil
